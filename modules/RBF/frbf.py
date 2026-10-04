@@ -1,6 +1,14 @@
 import torch
 import torch.nn.functional as F
+import gc, time
+import subprocess
 
+
+def get_gpu_temp():
+    result = subprocess.run(['nvidia-smi', '--query-gpu=temperature.gpu', 
+                           '--format=csv,noheader'], 
+                           capture_output=True, text=True)
+    return int(result.stdout.strip())
 
 def construct_phi(  image, sigma, NodeX1, NodeX2, batch_size=None,
                     pixel_pos=None, center_pos=None, threshold=1e-9):
@@ -68,7 +76,9 @@ class WeightCalculator:
         self.device = device
         
         if input_w is None:
-            self.weights = (torch.rand(nIn, dtype=torch.float32, device=device) * 0.1 - 0.05)
+            #self.weights = (torch.rand(nIn, dtype=torch.float32, device=device) * 0.1 - 0.05)
+            self.weights = torch.zeros(nIn, dtype=torch.float32, device=device) + 1e-6
+            #self.weights = torch.rand(nIn, dtype=torch.float32, device=device)
         else:
             self.weights = torch.as_tensor(input_w, dtype=torch.float32).to(device)
     
@@ -84,13 +94,15 @@ class WeightCalculator:
         gradient = torch.matmul(pixel_nod_grid.transpose(0, 1), delta) / self.nIn
 
         self.weights += teta * gradient
+
+        return torch.norm(gradient)
     
     def get_weights(self):
         return self.weights
 
 
 def train_weights(netSp_sparse, targetSp_tensor, nIterations, start_teta, 
-                           decay_rate=0.99, input_w=None, min_teta=0.01):
+                           decay_rate=0.99, input_w=None, min_teta=0.01, debug=False):
     """
     Полностью векторизованное обучение весов
     
@@ -106,6 +118,7 @@ def train_weights(netSp_sparse, targetSp_tensor, nIterations, start_teta,
     Returns:
         seq_weights: список весов для всех узлов
     """
+    gc.disable()
     
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if not isinstance(targetSp_tensor, torch.Tensor):
@@ -119,10 +132,18 @@ def train_weights(netSp_sparse, targetSp_tensor, nIterations, start_teta,
     
     seq_weights = []
     count = 0
-    
+    timing_info = []
+    overall_start = time.time()
+
+    torch.cuda.empty_cache()  # Очищаем кэш перед началом
+    torch.cuda.synchronize()
+
     for batch_idx, batch_sparse in enumerate(netSp_sparse):
+        batch_start = time.time()
         batch_size = batch_sparse.shape[0]
-        
+
+        if debug:
+            mem_before = torch.cuda.memory_allocated() / 1024 / 1024 / 1024
         # можно давать начальные значения для ускорения
         # но на данный момент неясно, есть ли в этом смысл
         if input_w is not None and count < len(input_w):
@@ -137,24 +158,71 @@ def train_weights(netSp_sparse, targetSp_tensor, nIterations, start_teta,
         # Создаем модель для батча
         model = WeightCalculator(batch_size, input_w=batch_input_w, device=device)
         
-        # Конвертируем sparse to dense ОДИН РАЗ
-        batch_dense = batch_sparse.to_dense()  # [batch_size, X1, X2]
+        convert_start = time.time()
+        batch_dense = batch_sparse.to_dense() # [batch_size, X1, X2]
+        #torch.cuda.synchronize()
+        convert_time = time.time() - convert_start
         
         # Векторизованное обучение - цикл только по итерациям (неизбежно из-за изменения LR)
+        train_start = time.time()
+        min_loss = torch.as_tensor(1000, dtype=torch.float32, device=device)
+        optimal_weights = None
         for i in range(nIterations):
-            model.update_batch(batch_dense, target_flat, tetas[i])
+            loss = model.update_batch(batch_dense, target_flat, tetas[i])
+            if loss < min_loss:
+                min_loss = loss
+                optimal_weights = model.get_weights()
+        #torch.cuda.synchronize()
+        train_time = time.time() - train_start
         
         # Сохраняем веса
-        weights_cpu = model.get_weights().cpu()
-        seq_weights.append(weights_cpu)
-        
+        weights = optimal_weights if optimal_weights is not None else model.get_weights()
+        seq_weights.append(weights)
+        batch_time = time.time() - batch_start
         count += batch_size
+
+        if debug:
+            mem_after = torch.cuda.memory_allocated() / 1024 / 1024 / 1024
+            timing_info.append({
+                'batch_idx': batch_idx,
+                'batch_size': batch_size,
+                'convert_time': convert_time,
+                'train_time': train_time,
+                'total_time': batch_time,
+                'mem_before_gb': mem_before,
+                'mem_after_gb': mem_after,
+                'mem_diff_gb': mem_after - mem_before,
+                'min_loss': min_loss,
+                'final_loss': loss
+            })
+            
+            print(f"Batch {batch_idx}: {batch_time:.2f}s "
+                  f"(convert: {convert_time:.2f}s, train: {train_time:.2f}s) "
+                  f"Mem: {mem_before:.2f}GB → {mem_after:.2f}GB")
+            
+            if batch_idx % 10 == 0:  # Не каждый раз, чтобы не замедлять
+                        print(f"Температура GPU: {get_gpu_temp()}C")
+                    #    torch.cuda.empty_cache()
         
         del model, batch_dense
-        #if batch_idx % 5 == 0:  # Не каждый раз, чтобы не замедлять
-        #    torch.cuda.empty_cache()
+        
     
-    # Объединяем все веса
-    all_weights = torch.cat(seq_weights).numpy()
+    overall_time = time.time() - overall_start
     
-    return all_weights.tolist()
+    # Включаем GC обратно
+    gc.enable()
+    gc.collect()
+    
+    all_weights = torch.cat(seq_weights).cpu().numpy().tolist()
+    
+    if debug:
+        print(f"\nОбщее время: {overall_time:.2f}s")
+        print(f"Среднее время на батч: {overall_time/len(netSp_sparse):.2f}s")
+        print(f"Медленные батчи (>2x среднего):")
+        avg_time = overall_time / len(netSp_sparse)
+        for info in timing_info:
+            if info['total_time'] > 2 * avg_time:
+                print(f"  Batch {info['batch_idx']}: {info['total_time']:.2f}s "
+                      f"(mem diff: {info['mem_diff_gb']:+.2f}GB)")
+    torch.cuda.empty_cache()
+    return all_weights
