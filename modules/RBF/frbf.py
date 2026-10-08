@@ -76,6 +76,7 @@ class WeightCalculator:
         self.device = device
         
         if input_w is None:
+            #self.weights = (torch.rand(nIn, dtype=torch.float32, device=device) - 0.5) # big noise
             #self.weights = (torch.rand(nIn, dtype=torch.float32, device=device) * 0.1 - 0.05)
             self.weights = torch.zeros(nIn, dtype=torch.float32, device=device) + 1e-6
             #self.weights = torch.rand(nIn, dtype=torch.float32, device=device)
@@ -95,14 +96,14 @@ class WeightCalculator:
 
         self.weights += teta * gradient
 
-        return torch.norm(gradient)
+        #return torch.norm(gradient)
     
     def get_weights(self):
         return self.weights
 
 
 def train_weights(netSp_sparse, targetSp_tensor, nIterations, start_teta, 
-                           decay_rate=0.99, input_w=None, min_teta=0.01, debug=False):
+                           decay_rate=0.9, input_w=None, min_teta=0.01, debug=False):
     """
     Полностью векторизованное обучение весов
     
@@ -168,10 +169,13 @@ def train_weights(netSp_sparse, targetSp_tensor, nIterations, start_teta,
         min_loss = torch.as_tensor(1000, dtype=torch.float32, device=device)
         optimal_weights = None
         for i in range(nIterations):
-            loss = model.update_batch(batch_dense, target_flat, tetas[i])
+            #loss = 
+            model.update_batch(batch_dense, target_flat, tetas[i])
+            """
             if loss < min_loss:
                 min_loss = loss
                 optimal_weights = model.get_weights()
+            """
         #torch.cuda.synchronize()
         train_time = time.time() - train_start
         
@@ -193,12 +197,13 @@ def train_weights(netSp_sparse, targetSp_tensor, nIterations, start_teta,
                 'mem_after_gb': mem_after,
                 'mem_diff_gb': mem_after - mem_before,
                 'min_loss': min_loss,
-                'final_loss': loss
+                #'final_loss': loss
             })
             
             print(f"Batch {batch_idx}: {batch_time:.2f}s "
                   f"(convert: {convert_time:.2f}s, train: {train_time:.2f}s) "
-                  f"Mem: {mem_before:.2f}GB → {mem_after:.2f}GB")
+                  f"Mem: {mem_before:.2f}GB → {mem_after:.2f}GB "
+                  f"Final loss: {min_loss:.4f}")
             
             if batch_idx % 10 == 0:  # Не каждый раз, чтобы не замедлять
                         print(f"Температура GPU: {get_gpu_temp()}C")
